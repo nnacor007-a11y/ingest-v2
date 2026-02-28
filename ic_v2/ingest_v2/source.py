@@ -1,78 +1,92 @@
-from typing import Any, Dict, Tuple
-
-from .db import advisory_xact_lock, get_table_columns
-from .errors import DbError
-from .fingerprint import advisory_lock_key, fingerprint_hex
+from typing import Dict, Tuple, Any
+import psycopg2
 
 
-def _choose_source_match_fields(cols: Dict[str, str]) -> Tuple[str, ...]:
-    if "source_key" in cols:
-        return ("source_key",)
-    if "external_id" in cols and "system" in cols:
+def _non_empty(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str) and v.strip() == "":
+        return False
+    return True
+
+
+def _choose_source_match_fields(cols: Dict[str, str], payload: Dict[str, Any]) -> Tuple[str, ...]:
+    # 1) Prefer stable match: (system, external_id)
+    if (
+        "external_id" in cols
+        and "system" in cols
+        and _non_empty(payload.get("external_id"))
+        and _non_empty(payload.get("system"))
+    ):
         return ("system", "external_id")
-    if "url" in cols:
+
+    # 2) Use source_key only if non-empty
+    if "source_key" in cols and _non_empty(payload.get("source_key")):
+        return ("source_key",)
+
+    if "url" in cols and _non_empty(payload.get("url")):
         return ("url",)
-    if "name" in cols:
+
+    if "name" in cols and _non_empty(payload.get("name")):
         return ("name",)
+
     return tuple()
 
 
-def _choose_insert_fields(cols: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
-    candidate = {
-        "source_key": payload.get("source_key"),
-        "system": payload.get("system"),
-        "external_id": payload.get("external_id"),
-        "name": payload.get("name"),
-        "url": payload.get("url"),
-        "description": payload.get("description"),
-        "meta": payload.get("meta"),
-    }
-    return {k: v for k, v in candidate.items() if k in cols and v is not None}
+def get_or_create_source(conn, source_payload: Dict[str, Any]):
+    """
+    Returns: (source_id, source_outcome)
+    source_outcome ∈ {"CREATED", "EXISTING"}
+    """
 
+    with conn.cursor() as cur:
+        # discover table columns
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'ic_v2'
+              AND table_name = 'source'
+            """
+        )
+        cols = {r[0]: r[0] for r in cur.fetchall()}
 
-def get_or_create_source(conn, source_payload: Dict[str, Any]) -> Tuple[int, str]:
-    schema, table = "ic_v2", "source"
-    try:
-        with conn.cursor() as cur:
-            cols = get_table_columns(cur, schema, table)
+        match_fields = _choose_source_match_fields(cols, source_payload)
 
-            stable = {
-                "system": source_payload.get("system"),
-                "external_id": source_payload.get("external_id"),
-                "source_key": source_payload.get("source_key"),
-                "url": source_payload.get("url"),
-                "name": source_payload.get("name"),
-            }
-            fp = fingerprint_hex(stable)
-            advisory_xact_lock(cur, advisory_lock_key(fp))
+        if not match_fields:
+            raise RuntimeError("NO_MATCH_POSSIBLE")
 
-            match_fields = _choose_source_match_fields(cols)
+        where_clause = " AND ".join(f"{f} = %s" for f in match_fields)
+        values = [source_payload.get(f) for f in match_fields]
 
-            if match_fields:
-                where = " AND ".join([f"{f} = %s" for f in match_fields])
-                params = tuple(source_payload.get(f) for f in match_fields)
-                cur.execute(
-                    f"SELECT source_id FROM {schema}.{table} WHERE {where} ORDER BY source_id ASC LIMIT 1;",
-                    params,
-                )
-                row = cur.fetchone()
-                if row:
-                    return int(row[0]), "EXISTING"
+        cur.execute(
+            f"""
+            SELECT source_id
+            FROM ic_v2.source
+            WHERE {where_clause}
+            LIMIT 1
+            """,
+            values,
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0], "EXISTING"
 
-            insert_fields = _choose_insert_fields(cols, source_payload)
+        # insert new source
+        insert_cols = [k for k in source_payload.keys() if k in cols and source_payload.get(k) is not None]
+        insert_values = [source_payload[k] for k in insert_cols]
 
-            if insert_fields:
-                cols_sql = ", ".join(insert_fields.keys())
-                vals_sql = ", ".join(["%s"] * len(insert_fields))
-                params = tuple(insert_fields.values())
-                cur.execute(
-                    f"INSERT INTO {schema}.{table} ({cols_sql}) VALUES ({vals_sql}) RETURNING source_id;",
-                    params,
-                )
-                return int(cur.fetchone()[0]), "CREATED"
+        col_list = ", ".join(insert_cols)
+        placeholders = ", ".join(["%s"] * len(insert_values))
 
-            cur.execute(f"INSERT INTO {schema}.{table} DEFAULT VALUES RETURNING source_id;")
-            return int(cur.fetchone()[0]), "CREATED"
-
-    except Exception as e:
-        raise DbError("DbError:SourceUpsertFailed") from e
+        cur.execute(
+            f"""
+            INSERT INTO ic_v2.source ({col_list})
+            VALUES ({placeholders})
+            RETURNING source_id
+            """,
+            insert_values,
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        return new_id, "CREATED"
