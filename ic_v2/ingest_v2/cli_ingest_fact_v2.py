@@ -82,4 +82,14 @@ def run(args: argparse.Namespace) -> int:
         try:
             conn.close()
         except Exception:
-            pass
+            pass# ---- module entrypoint ----
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ingest-fact-v2")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    build_parser(subparsers)
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
