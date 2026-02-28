@@ -47,6 +47,13 @@ def ingest_fact_append_only(conn, fact_payload: Dict[str, Any], source_id: int) 
 
             where_sql, mode = _choose_fact_match_predicate(cols, json_col)
 
+            # HARD FAIL: sin columnas suficientes no se puede garantizar idempotencia.
+            # Gate: NO_MATCH_POSSIBLE no puede insertar.
+            if mode == "NO_MATCH_POSSIBLE":
+                raise RuntimeError(
+                    "Idempotency not possible for ic_v2.fact: missing fingerprint/json/core fields; refusing to insert."
+                )
+
             if mode.startswith("COL:") or mode.startswith("JSON:"):
                 check_params = (fp,)
             elif mode == "CORE_FIELDS":
